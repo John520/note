@@ -1,0 +1,1 @@
+* untrack folder :`git rm -rf --cached .idea`
