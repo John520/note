@@ -135,3 +135,37 @@ a 上有序，id 上可能乱序，那么MRR 会将id 按照升序的方式排�
     这个权限修改是即时生效
 
 备注:正常不需要 `flush privileges`，除非某些异常导致数据库里面db的权限和内存不一致才需要使用
+
+## MySQL 自增主键
+1. 表结构定义在`.frm`中，但是自增值并不保存在这里，MyISAM 保存在数据文件，
+Innodb在 MySQL 8.0之后才支持`自增持久化`，记录在redo log
+5.7之前是第一次打开表时max(id)找到自增主键
+
+2. 新的自增值生成算法是：从 auto_increment_offset 开始，以 auto_increment_increment 为步长，持续叠加，直到找到第一个大于 X 的值，作为新的自增值。
+默认初始值和步长为1，在双主架构下，步长为2 ，一个用奇数，一个用偶数，避免主键冲突
+
+3. 自增主键不回退，若事务回滚，申请的主键自增后不会回滚
+
+### 自增锁
+innodb_autoinc_lock_mode :
+* 0:语句执行完才释放；
+* 1：普通insert 申请之后就释放；insert...select 需要语句执行完才释放；
+* 2：不管怎样，申请之后就释放，不能语句执行完
+
+若在binlog_format=statement下只能选 0，1，否则可能导致主备数据不一致
+![img.png](./asset/img.png)
+1. session B 先插入了两个记录，(1,1,1)、(2,2,2)；
+2. session A 来申请自增 id 得到 id=3，插入了（3,5,5)；
+3. session B 继续执行，插入两条记录 (4,3,3)、 (5,4,4)。
+
+备注： binlog_format=statement,innodb_autoinc_lock_mode=1下  
+session A: insert  into t (null,1); //获取到主键1  
+session B: insert  into t (null,2); //获取到主键2，然后先提交了事务，是否会导致 备库上数据不一致,即（2,1）(1,2)  
+答案：不会，binlog 会记录这一条的自增ID值，以及插入SQL,所以虽然B先先提交，但是它自增主键的值还是2
+
+### 自增主键不一定完全自增？
+1. 回滚导致主键不连续
+2. 唯一索引冲突导致主键不连续
+3. 回滚事务导致主键不连续
+4. 批量自增导致不连续（对于批量插入的语句，第一次申请自增1，第n-1次申请自增m,第n次申请自增2m）
+
