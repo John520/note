@@ -158,10 +158,14 @@ innodb_autoinc_lock_mode :
 2. session A 来申请自增 id 得到 id=3，插入了（3,5,5)；
 3. session B 继续执行，插入两条记录 (4,3,3)、 (5,4,4)。
 
-备注： binlog_format=statement,innodb_autoinc_lock_mode=1下  
+备注： 
+1. binlog_format=statement,innodb_autoinc_lock_mode=1下  
 session A: insert  into t (null,1); //获取到主键1  
 session B: insert  into t (null,2); //获取到主键2，然后先提交了事务，是否会导致 备库上数据不一致,即（2,1）(1,2)  
 答案：不会，binlog 会记录这一条的自增ID值，以及插入SQL,所以虽然B先先提交，但是它自增主键的值还是2
+2. insert t1 select * from t 为什么会锁t全表？
+在RC下，如果不锁全表，并发事务在`t`中在插入数据，记为`r1`，并先提交事务，在备库中重放将导致数据不一致，
+也即在主库中`t1`中不存在`r1`,但是在被库中t1存在`r1`
 
 ### 自增主键不一定完全自增？
 1. 回滚导致主键不连续
