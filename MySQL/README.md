@@ -1,3 +1,93 @@
+# 日志系统
+
+## redo log&bin log
+
+* redo log 属于引擎层 是物理日志，记录在那一页修改了啥，底层由四个文件循环写入
+* bin log  数据server 层，是逻辑日志. 记录 SQL或statement. 是追加写入，用于备份或主从同步
+
+## 两阶段提交
+
+redo log prepare( 数据落盘) -->write bin log  --> coimmit binlog
+
+Crash safe 处理：
+
+1. 若在write bin log 之前 crash, 机器恢复时会回滚redo log,保证主从一致
+2. 若在 write bin log 之后crash ,机器恢复时会提交redo log,因为主从同步是以bin log 为准，要保证主从一致需要提交redo log
+
+# 事务的隔离性
+
+## 隔离级别
+
+* 读未提交
+* 读已提交
+* 可重复读
+* 串行化
+
+
+
+读数据有：**当前读**(select .. for update/ lock in share/write mode)或**快照读**（普通select）
+
+**当前读 **通过加锁机制保证隔离性
+
+**快照读** 通过 read view 保证隔离性。每个row隐藏有两个列，一个trxid 和 rollback_ptr ,通过不断回滚（执行undo log）回滚到之前版版本，从而保证在事务内，可重复读。
+
+备注： 如果有长事务操作数据，将导致该行数据需要不断回滚才能读到对应版本的数据
+
+```select * from information_schema.innodb_trx where TIME_TO_SEC(timediff(now(),trx_started))>60```
+
+
+
+# 索引
+
+* 主键索引（聚簇索引）
+* 二级索引（辅助索引）
+
+主键不应太大，不然会导致二级索引的叶子节点太大，从而占用的空间也变大
+
+## 覆盖索引
+
+索引包含查询的全部字段，不需要二次回表（回主键索引查询）查询其他字段信息，这也是不推荐select * 的原因之一
+
+## 最左前缀
+
+若索引idx(a,b,c) ，则 
+
+* where a=**  ，where a=** and b=** ，where a=** and b=**  and  c=** 可以使用索引
+* where a=**  and b=**  order by c 可以使用索引
+
+## 索引下推 Index push down
+
+``` sql
+select * from tuser where name like '张%' and age=10 and ismale=1;
+```
+
+假如 tuser  有普通索引KEY `name_age` (`name`,`age`) ，5.6之前，只能使用 name 在引擎层过滤数据后返回server 层，导致很多age 不等于10的数据也返回，5.6 版本的索引下推，可以使得在引擎层过滤不满足的条件，减少回表次数
+
+# 锁
+
+* 全局锁：Flush tables with read lock (FTWRL) ，仅适合全库逻辑备份。若RR隔离级别，可以用mysqldump 使用参数–single-transaction 的时候，导数据之前就会启动一个事务，来确保拿到一致性视图，避免全局锁
+* 表级锁
+  * 表锁: lock tables … read/write
+  * 元数据锁 MDL : 执行DDL是需要先获得MDL写锁。DML 则需要获得MDL 读锁， 所以DML 和DDL 是互斥
+
+
+
+
+
+备注：若一个长事务执行DML ，导致DDL 阻塞，会导致DDL 之后进来的DML 也阻塞（由于DDL 在排队拿MDL 写锁，导致他们拿不到MDL 读锁），所以给小表加字段，建议innodb_trx 中查找长事务，然后kill。 或者先暂停DDL
+
+5.6 online DDL 过程：
+
+1. 拿MDL写锁 
+2.  降级成MDL读锁 
+3.  真正做DDL 
+4.  升级成MDL写锁 
+5.  释放MDL锁
+
+整整DDL 耗时比较就在第3步，所以在DDL 大部分时间内可以正常执行DML
+
+ 
+
 # 分库分表
 
 ### 何时分库分表
