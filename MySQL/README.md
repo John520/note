@@ -1,3 +1,45 @@
+# 三大范式
+
+* 每个列不能拆分
+* 每个非主键列必须依赖主键，不能依赖主键的部分
+* 每个非主键列之间不能互相依赖
+
+# Innodb 和 MyISAM 索引区别
+
+* Innodb 是聚簇索引，也即数据节点存放在叶子节点，使用聚簇索引只需要一次查找
+* MyISAM 是非聚簇索引，叶子节点存放的行地址，每次都需要两次查找
+
+# B+树和B树区别
+
+* B+树 数据仅存放在叶子节点，也即树高度为4 ，每次都需要4次IO(假定索引树在磁盘),B树中间节点也可以存放数据，故查找时间和数据节点在哪一层有关
+* B+树叶子节点之间用双向链表关联，范围查找容易，而且可以充分利用预读功能，一次读取多个数据行，B树需要遍历各层
+
+# 超大分页怎么处理
+
+如:
+
+ ```sql
+select * from table where age > 20 limit 1000000,10
+ ```
+
+1. 替换为
+
+   ```sql
+   select * from table where id in (select id from  table where age > 20 limit 1000000,10)
+   ```
+
+   
+
+2. 每次获取分页是记录上一个分页的最大id,然后依次向后查找
+
+# 数据类型
+
+## timestamp 和datetime区别
+
+* Timestamp 4 字节(1970年-2038年) datatime 8字节
+* Timestamp 会根据当前时区自动转换，datetime 不会
+* timestamp 插入null 会自动转为当前时间
+
 # 日志系统
 
 ## redo log&bin log
@@ -35,6 +77,20 @@ Crash safe 处理：
 
 ```select * from information_schema.innodb_trx where TIME_TO_SEC(timediff(now(),trx_started))>60```
 
+## 快照读 MVCC
+
+若是通过begin 开启事务，则在第一个sql 执行时创建 read view 视图，若通过 start transaction with consistent snapshot，则立即创建视图。若是RR 隔离级别，则在一个事务内只会创建一个事务，保证可重复读，若是RC 隔离级别，则每次SQL创建视图，保证每次都能读到没人提交的更改（也是读已提交的由来）
+
+read view 包括：
+
+* up_limit_id 低水位：创建视图时，正在运行（未提交事务）的trx_id 列表的最小值。 故这之前的事务都是可见
+* low_limit_id 高水位：每次开启事务都会先MySQL 申请trx_id ,且trx_id 是递增。创建试图时，记录的是系统最大的trx_id。故这之后的事务都不可见
+* trx_ids 正在运行的事务列表：在事务列表的事务都不可见（说明开启事务是，事务还未提交），不在事务列表的都可见（说明开启事务时，事务已经提交）
+
+备注： 当前事务trx_id 在低水位和高水位之间，故低水位到 trx_id 之前可能有数据已提交，也即不在trx_ids中
+
+
+
 
 
 # 索引
@@ -63,6 +119,26 @@ select * from tuser where name like '张%' and age=10 and ismale=1;
 
 假如 tuser  有普通索引KEY `name_age` (`name`,`age`) ，5.6之前，只能使用 name 在引擎层过滤数据后返回server 层，导致很多age 不等于10的数据也返回，5.6 版本的索引下推，可以使得在引擎层过滤不满足的条件，减少回表次数
 
+## 唯一索引 or 普通索引 
+
+首先保证业务正确性，若可以在业务逻辑上保证唯一性，则推荐DB 使用普通索引
+
+因为针对普通索引，若数据也不在内存buffer pool 中，可以记录新增或修改的row 信息，利用**change buffer**. 后续有其他读操作需要数据，将数据从磁盘读入内存，并且和 change buffer 中的数据merge. 可以提高数据的插入速度。同时change buffer 也会记录redo log,避免宕机后数据丢失。多同一页面的多次修改，可以延时到后面的一次merge,减少随机IO
+
+注意区分redo log 和 change buffer 作用：
+
+* redo log 主要节省的是随机写磁盘的 IO 消耗（转成顺序写）
+
+* change buffer 主要节省的则是随机读磁盘的 IO 消耗
+
+## 优化器选错索引
+
+* 索引统计值（cardinality 列）不准确。MySQL采用抽样的方式，当有1/M 的数据变更后，抽N个page统计基数cardinality
+
+`show index from table`可以查各个索引的基数
+
+
+
 # 锁
 
 * 全局锁：Flush tables with read lock (FTWRL) ，仅适合全库逻辑备份。若RR隔离级别，可以用mysqldump 使用参数–single-transaction 的时候，导数据之前就会启动一个事务，来确保拿到一致性视图，避免全局锁
@@ -70,9 +146,7 @@ select * from tuser where name like '张%' and age=10 and ismale=1;
   * 表锁: lock tables … read/write
   * 元数据锁 MDL : 执行DDL是需要先获得MDL写锁。DML 则需要获得MDL 读锁， 所以DML 和DDL 是互斥
 
-
-
-
+* 行锁 （MyISAM 不支持）
 
 备注：若一个长事务执行DML ，导致DDL 阻塞，会导致DDL 之后进来的DML 也阻塞（由于DDL 在排队拿MDL 写锁，导致他们拿不到MDL 读锁），所以给小表加字段，建议innodb_trx 中查找长事务，然后kill。 或者先暂停DDL
 
@@ -85,6 +159,20 @@ select * from tuser where name like '张%' and age=10 and ismale=1;
 5.  释放MDL锁
 
 整整DDL 耗时比较就在第3步，所以在DDL 大部分时间内可以正常执行DML
+
+
+
+行锁容易产生死锁：
+
+1. 超时则回滚事务，超时时间有 innodb_lock_wait_timeout=50s 控制
+2. 死锁检测: 耗费CPU 资源，可以通过控制并发来减少死锁检测耗费的资源
+
+死锁条件：
+
+* 持有并等待
+* 不可剥夺
+* 循环依赖
+* 互斥
 
  
 
