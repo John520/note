@@ -56,6 +56,30 @@ Crash safe 处理：
 1. 若在write bin log 之前 crash, 机器恢复时会回滚redo log,保证主从一致
 2. 若在 write bin log 之后crash ,机器恢复时会提交redo log,因为主从同步是以bin log 为准，要保证主从一致需要提交redo log
 
+# 系统抖动
+
+系统抖动，经常是因为系统更新操作多，需要操作内存和日志，抖动可能是因为在刷脏页.系统抖动将导致其他SQL 时延增加
+
+* Redo log 满了。 redo log 底层是4个文件循环写入，当write pos 追上 check point.系统无法写入redo log ,需要将其刷盘
+
+  * `innodb_io_capacity`系统根据这个参数来评估刷盘速度，若设置过小，系统认为IOPS很低，会经常执行刷盘动作，导致频繁抖动
+
+  * `innodb_max_dirty_pages_pct`默认75，即脏页超过75%，将按照R% *IOPS（由`innodb_io_capacity`决定）速度刷盘
+
+    <img src="asset/flush.png" alt="img" style="zoom: 33%;" />
+
+  * `innodb_flush_neighbors`是否开启刷盘连坐（1开启）。刷盘是发现邻居也是脏页，则一起刷盘，可以减少随机IO
+
+* 内存不足，并且是脏页（可能是数据页或索引页），需要将脏页刷盘，再载入所需的页
+
+* 系统关机，正常刷脏页（不影响性能）
+
+* 系统空闲，后台线程在刷脏页（不影响性能）
+
+
+
+
+
 # 事务的隔离性
 
 ## 隔离级别
@@ -133,9 +157,72 @@ select * from tuser where name like '张%' and age=10 and ismale=1;
 
 ## 优化器选错索引
 
-* 索引统计值（cardinality 列）不准确。MySQL采用抽样的方式，当有1/M 的数据变更后，抽N个page统计基数cardinality
+原因：
 
-`show index from table`可以查各个索引的基数
+* 索引统计值（cardinality 列）不准确。MySQL采用抽样的方式，当有1/M 的数据变更后，抽N个page统计基数cardinality
+* 若使用辅助索引扫描的行数过多（超过1/3），则优化器认为直接使用主键扫全表更快（因为辅助索引还要回表）
+* 排序影响。如表t 有a，b 两个索引，order by b limit 1.可能会导致优化器选择b,但是实际上a 可能更优
+
+解决方式：
+
+* `show index from table`可以查各个索引的基数。统计值不准确可以通过`analyze table t`进行矫正
+
+* 使用`force index `指定索引:
+
+  * ```sql
+    //原sql
+    select * from t where a between 10000 and 20000;
+    //优化
+    select *  force index(a) from t where a between 10000 and 20000;`
+    ```
+
+* 新建更好索引或删除误用的索引
+
+* 在不改变语义的情况，修改SQL，来调整优化器选择策略
+
+  * ```sql
+    //原sql
+    select * from t where (a between 1 and 1000) and (b between 50000 and 100000) order by b limit 1;
+    //优化后
+    select * from  (select * from t where (a between 1 and 1000)  and (b between 50000 and 100000) order by b limit 100)alias limit 1; //优化器选择 a, a 的扫描行数更少，哪怕重新排序也只对100行排序
+    ```
+
+## 如何给字符串建索引
+
+* 选择字符串中区分度（基数cardinality）比较高的子串
+
+  * **前缀索引**。比如有邮箱建立索引，因为后面都是@xx.com的固定串，所以我们选择前缀索引就行，具体选择多长可以判断哪个区分度高，如下所示
+
+    ```sql
+    select count(distinct email) as L from SUser;
+    
+    select 
+      count(distinct left(email,4)）as L4,
+      count(distinct left(email,5)）as L5,
+      count(distinct left(email,6)）as L6,
+      count(distinct left(email,7)）as L7,
+    from SUser;
+    ```
+
+    选择L*/L >=0.95 的即可
+
+  * **倒序存储，再前缀索引。**如身份证这种，前缀都差不多，我们存储的时候可以将身份证倒序存储，并建立前缀索引
+
+    ```sql
+    select field_list from t where id_card = reverse('input_id_card_string');
+    ```
+
+  * **哈希索引。**比如在card_id 字段加一个 card_id_crc来记录身份证的哈希值,并对其建立索引值。**索引字段较小**
+
+    ```sql
+    select field_list from t where id_card_crc=crc32('input_id_card_string') and id_card='input_id_card_string'
+    ```
+
+### 前缀子串或哈希索引缺点
+
+* 不能利用覆盖索引的优势，需要回表
+* 哈希索引不能范围查询
+* Crc32()或reverse()函数有CPU 损耗
 
 
 
