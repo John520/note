@@ -28,8 +28,6 @@ select * from table where age > 20 limit 1000000,10
    select * from table where id in (select id from  table where age > 20 limit 1000000,10)
    ```
 
-   
-
 2. 每次获取分页是记录上一个分页的最大id,然后依次向后查找
 
 # 数据类型
@@ -76,9 +74,78 @@ Crash safe 处理：
 
 * 系统空闲，后台线程在刷脏页（不影响性能）
 
+# 数据删除了，数据库空间占用没有变小？
+
+### innodb_file_per_table
+
+* on 数据放在当杜的文件，放在.ibd 后缀文件中（5.6.6 后默认开启），drop table 可以直接删除 ibd文件。
+* off 数据放在系统共享表空间中，删除表也不会回收空间。
+
+### 哪些情况会导致数据空洞
+
+* 删除数据
+* 插入数据 （页分裂），可以优化为自增主键
+
+备注：数据删除，会产生空洞，该空洞是***可复用记录***，下次如果有记录要刚好在空洞位置，可以复用该空间。
+
+如果数据页合并导致一个数据也空闲或删除了一个页上的全部记录会形成 ***可复用数据页***，下次分配新的数据页时可以直接使用
+
+以上***可复用记录*** 和  ***可复用数据页***都不会返回操作系统。所以数据空间不会变小
+
+### 如何释放占用的空间（重建表）？
+
+由于数据是在B+树上 ，上述节点的空洞占用了很多空间，重建表空间可以重新整理数据，减少孔洞，释放空间。
+
+```sql
+alter table t engine=InnoDB
+```
 
 
 
+<img src="asset/recreate_table_1.png" alt="img" style="zoom:50%;" />
+
+以上数据会长期占用MDL写锁，此时不能对表DDL ,这个操作是在server层新建临时表，所以是非inplace. MySQL 5.6之前采用刚方式。
+
+<img src="asset/recreate_table_2.png" alt="img" style="zoom:50%;" />
+
+5.6之后采用OnlineDDL重建表，在innodb 层实现，对server 透明（称为inplace），重建过程允许对表执行DDL。将增量数据记录在row log. 
+
+> 在重建表的时候，InnoDB 不会把整张表占满，每个页留了 1/16 给后续的更新用。也就是说，其实重建表之后不是“最”紧凑的。
+
+OnlineDDL 过程
+
+* 开始获取 MDL **写锁**，获取表结构后 
+* 将MDL 写锁降级为**读锁**，开始复制到临时表（这个过程很耗时，但是不持有MDL写锁，所以叫Online）
+* 此后其他线程可以执行DDL,最后升级MDL读锁为**写锁**应用增量数据row log, 并将表替换为新的表。
+
+> 备注：
+>
+> * alter table t engine = InnoDB 重建表
+> * analyze table t ：没有重建表，仅重新统计索引信息
+>
+> * optimize table t 等于 recreate+analyze。
+
+# count(*)
+
+1. MyISAM 每个表会记录行记录，所以很快，但是不支持事务
+
+2. Innodb 会遍历全表，结果准确，使用MVCC (read view) 支持事务，会使用最小的索引树扫描
+
+3. show table status 可以查看大概值，返回快，但是不准却
+
+## 如何让mysql 快速返回准确的count(*)
+
+1. 使用缓存记录，缓存可能和DB 不一致，定期修正
+2. 使用事务记入到DB
+
+## 那种方式最好？
+
+按照优先级递减
+
+* count(*) 取全部行包括Null ,很多数据库会对其优化
+* count(1) 相比count(id) 不取出id,对返回列表计数，效率约等于count(*)
+* count(id) 引擎层取出id,server 进行计数
+* count(字段) 若字段可以为Null ,则Null 不会计算在内
 
 # 事务的隔离性
 

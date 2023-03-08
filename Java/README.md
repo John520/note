@@ -41,3 +41,96 @@
 
 5. OSGI、Jigsaw等模块化技术的应用:
 
+
+
+## Java agent
+
+Java Agent 是在 Java 应用程序运行时期间动态地附加或注入到 Java 虚拟机（JVM）进程中的一段 Java 程序。Java Agent 可以以某种方式修改或增强 Java 应用程序的行为，例如监视或分析应用程序，或者向应用程序注入额外的代码以实现跟踪、调试或性能分析。
+
+
+
+Java Agent 的主要特点包括：动态附加到运行中的 Java 应用程序；能够拦截、修改或替换 Java 应用程序中的类、方法、变量等元素；可以访问和监视应用程序的 JVM 内部状态和性能数据等。
+
+## Java agent 代理入口
+
+ jar 文件的manifest 需要指定agent 全限定类名，根据启动实际不同可以选择不同改的方式，以下二选一
+
+```java
+// 用于JVM刚启动时调用，其执行时应用类文件还未加载到JVM
+public static void premain(String agentArgs, Instrumentation inst);
+ 
+// 用于JVM启动后，在运行时刻加载
+public static void agentmain(String agentArgs, Instrumentation inst);
+```
+
+Instrumentation接口定义
+
+```java
+public interface Instrumentation {
+    /**
+     * 注册一个Transformer，从此之后的类加载都会被Transformer拦截。
+     * Transformer可以直接对类的字节码byte[]进行修改
+     */
+    void addTransformer(ClassFileTransformer transformer);
+    
+    /**
+     * 对JVM已经加载的类重新触发类加载。使用的就是上面注册的Transformer。
+     * retransformation可以修改方法体，但是不能变更方法签名、增加和删除方法/类的成员属性
+     */
+    void retransformClasses(Class<?>... classes) throws UnmodifiableClassException;
+    
+    /**
+     * 获取一个对象的大小
+     */
+    long getObjectSize(Object objectToSize);
+    
+    /**
+     * 将一个jar加入到bootstrap classloader的 classpath里
+     */
+    void appendToBootstrapClassLoaderSearch(JarFile jarfile);
+    
+    /**
+     * 获取当前被JVM加载的所有类对象
+     */
+    Class[] getAllLoadedClasses();
+}
+//ClassFileTransformer接口，定义如下：
+/**
+ * 传入参数表示一个即将被加载的类，包括了classloader，classname和字节码byte[]
+ * 返回值为需要被修改后的字节码byte[]
+ */
+byte[]
+transform(  ClassLoader         loader,
+            String              className,
+            Class<?>            classBeingRedefined,
+            ProtectionDomain    protectionDomain,
+            byte[]              classfileBuffer)  throws IllegalClassFormatException;
+```
+
+manifest 例子：
+
+```properties
+Manifest-Version: 1.0
+Can-Redefine-Classes: true
+Class-Path: javassist-3.27.0-GA.jar postgresql-42.3.1.jar checker-qual-3.5.0.jar
+Can-Set-Native-Method-Prefix: true
+Premain-Class: com.congge.agent.MyPreMainAgent
+Can-Retransform-Classes: true
+
+ 
+```
+
+## 加载方式
+
+- 启动时加载：通过vm的启动参数-javaagent:**.jar来启动
+- 启动后加载：在vm启动后的任何时间点，通过attach api，动态地启动agent
+
+![img](asset/java-agent.png)
+
+
+
+参考：
+
+https://cloud.tencent.com/developer/article/1950546
+
+https://blog.csdn.net/zhangcongyi420/article/details/128162591
