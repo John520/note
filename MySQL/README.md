@@ -293,6 +293,48 @@ select * from tuser where name like '张%' and age=10 and ismale=1;
 
 
 
+# 什么情况无法使用索引？
+
+* like没有使用前缀匹配，如 `like %name%`
+
+* 索引字段使用函数会计算， 如 `age-1=30 或 `month(t_modified)=7`
+
+  需要改成 `age=31`或`(t_modified >= '2016-7-1' and t_modified<'2016-8-1')`
+
+* 隐式类型转换。如 `where tradeid=110717;` 原来tradeid 字段是varchar ,需要转化为整型。
+
+  实际优化器会优化sql 为 `CAST(tradid AS signed int) = 110717`
+
+  > MySQL 中，字符串和数字做比较的话，是将字符串转换成数字。
+  >
+  > 故如果tradeid 是int , `where tradeid="110717"`是没有会使用索引，因为会将"110717"转110717
+
+* 隐式编码转换
+
+  ```sql
+  select d.* from tradelog l, trade_detail d where d.tradeid=l.tradeid and l.id=2; /*语句Q1*/
+  ```
+
+  ![img](asset/not_using_index.png)
+
+  使用l 作为驱动表，使用索引获取id=2 这一行，但是在d表中没有使用索引（尽管l 表中在id 字段有索引）。
+
+  原因是l,d两个表的字符集不一样。l 是 uft8mb4, d是utf8(是 utf8mb4子集)，所以需要将 l.tradeid强制类型转换为utf8mb4,导致无法使用索引,效果如下需要对被驱动表类型转换
+
+  ```sql
+  select * from trade_detail  where CONVERT(traideid USING utf8mb4)=$L2.tradeid.value; 
+  ```
+
+* 使用不等于,not in。如索引（a,b,c）。`where a!=100  ` 或`where a not in(10,20)`
+
+* Order by 排序不符合索引。如索引（a,b,c） `where a=1 order by c,b`
+
+  
+
+> 隐式类型转换后，对索引字段做函数操作，可能会破坏索引值的有序性，因此优化器就决定放弃走树搜索功能
+
+
+
 # 锁
 
 * 全局锁：Flush tables with read lock (FTWRL) ，仅适合全库逻辑备份。若RR隔离级别，可以用mysqldump 使用参数–single-transaction 的时候，导数据之前就会启动一个事务，来确保拿到一致性视图，避免全局锁
@@ -327,6 +369,27 @@ select * from tuser where name like '张%' and age=10 and ismale=1;
 * 不可剥夺
 * 循环依赖
 * 互斥
+
+## 排查sql 阻塞
+
+1. 等待MDL。（lock table t write 或者5.6 之前的DDL不是onlineDDL,会长时间锁住MDL 写锁）
+
+   ```sql
+   show processlist; //可以查询那个pid状态，阻塞在哪里。
+   select blocking_pid form sys.schema_table_lock_waits; //查询那个线程的sql 阻塞
+   ```
+
+2. 等待flush .如 flush table t with read lock；锁t 表 或 flush table  with read lock; 锁这个库
+
+3. 行锁。并发事务更新或select ... lock in share mode .锁住行
+
+   ```sql
+   select * from t sys.innodb_lock_waits where locked_table='`test`.`t`'
+   ```
+
+4. 慢查询。`set long_query_time=0` 可以将全部sql 的耗时记录到show log
+
+
 
  
 
@@ -411,17 +474,55 @@ select * from tuser where name like '张%' and age=10 and ismale=1;
 
 ## Order By 如何工作？
 
-如：`select id,name,age from t wher age>20 and age<50;` `age`上有索引，`id`是主键，则，语句执行会利用`age`
-索引找到合适记录的主键`id`,然后会表查出 `name` 和 `age` 字段放入`sort buffer` 排序，这种称为全字段排序，若查询的字段信息特别大
-，超过了 `max_length_for_sort_data`，那么只把`age,id`放入`sort buffer`排序，然后在会主键表查询返回客户端
+如：`select id,name,age from t where age>20 and age<50 order by name;` `age`上有索引,`name`没有索引，`id`是主键，
 
-故内存允许，MySQL优先使用`全字段排序`。优化措施使用覆盖索引，避免回表会排序
+* 全字段排序。语句执行会利用`age`索引找到合适记录的主键`id`,然后会表查出 `name` 和 `age` 字段放入`sort buffer` 排序
+* rowid 排序。若查询的字段信息特别大，超过了 `max_length_for_sort_data`，那么只把`age,id`放入`sort buffer`排序，然后在回主键表查询返回客户端
+
+故内存允许，MySQL优先使用`全字段排序`。优化措施使用覆盖索引，避免回表会排序。
 体现在explain 中就是 `using index condition（需要回表）,using file sort` 变为`using index`（使用覆盖索引）
+
+> * 若内存放不下，mysql 会将数据分成多份放在临时文件中，各个文件有序，然后使用归并排序，再合并成一个大文件
+>
+> * 将索引age 改成 （age,name）联合索引可以避免排序
+
+# 如何从表中随机选出三行？
+
+1. ```sql
+   select word from words order by rand() limit 3;
+   ```
+
+   这种需要建立临时表，若数据量大放不下内存，会使用磁盘临时表，使用innodb 引擎，若数据能放得下内存，则使用内存临时表，使用memory 引擎（是否放得下又参数`tmp_table_size`控制，默认16M）.explain 发现有`Using temporary` 和 `Using filesort`
+
+   这里首先会创建内存临时表，表中包括rowid 和 random,然后扫描原表插入到内存临时表，由于内存临时表对于回表没有性能损耗，会使用rowid 排序，故sort buffer 有 rowid,random . 由于limit 3 比较少，会使用最大堆排序，仅保留3个元素，若limit 10000则会采用文件归并排序。这种方式需要扫表两次并进行排序，性能较差
+
+2. ```sql
+   select max(id),min(id) into @M,@N from t ;
+   set @X= floor((@M-@N+1)*rand() + @N);
+   select * from t where id >= @X limit 1;
+   ```
+
+   在id 分布不均的情况下，有概率不均问题。 性能最好
+
+3. ```sql
+   
+   select count(*) into @C from t;
+   set @Y = floor(@C * rand());
+   set @sql = concat("select * from t limit ", @Y, ",1");
+   prepare stmt from @sql;
+   execute stmt;
+   DEALLOCATE prepare stmt;
+   ```
+
+   概率均衡，性能略低于2，高于1.优先推荐
+
+
 
 
 ## MySQL LRU 如何实现,一个全表扫描是否会导致Buffer缓存全部失效？
 MySQL 的buffer一般建议设置到机器内存的60%-80%，如果正常的LRU 算法，大表的全表扫描将导致热点数据都被淘汰，
 所以MySQL 的 LRU算法做了一个改进，将内存5:3划分yong区和old区.
+
 * 数据第一次读入内存在old区，若在1s 内重复访问，不会移动到队头
 * 若old区的数据在1s内重复访问，则移动到队头，改时间具体由参数`innodb_old_blocks_time`控制
 * 若内存不足，直接移除队尾数据，也即old 队尾
